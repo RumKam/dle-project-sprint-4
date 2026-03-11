@@ -14,7 +14,7 @@ import torchmetrics
 
 from transformers import AutoModel, AutoTokenizer
 
-from dataset import MultimodalDataset, collate_fn, get_transforms
+from scripts.dataset import MultimodalDataset, collate_fn, get_transforms
 
 
 def seed_everything(seed: int):

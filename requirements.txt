@@ -153,7 +153,7 @@ tornado==6.5.1
 tqdm==4.67.1
 traitlets==5.14.3
 transformers==4.52.4
-triton==3.3.1
+#triton==3.3.1
 trove-classifiers==2025.5.9.12
 typer==0.16.0
 typing-extensions==4.14.0
@@ -167,3 +167,4 @@ weasel==0.4.1
 wrapt==1.17.2
 zipp==3.23.0
 zstandard==0.23.0
+seaborn==0.13.2
