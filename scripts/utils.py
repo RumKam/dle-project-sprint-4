@@ -1,19 +1,14 @@
 import os
 import random
 from functools import partial
-
 import numpy as np
-
 import timm
 import torch
 import torch.nn as nn
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
-
 import torchmetrics
-
 from transformers import AutoModel, AutoTokenizer
-
 from scripts.dataset import MultimodalDataset, collate_fn, get_transforms
 
 
@@ -56,25 +51,40 @@ class MultimodalModel(nn.Module):
         self.text_proj = nn.Linear(self.text_model.config.hidden_size, config.HIDDEN_DIM)
         self.image_proj = nn.Linear(self.image_model.num_features, config.HIDDEN_DIM)
 
-        self.classifier = nn.Sequential(
-            nn.Linear(config.HIDDEN_DIM, config.HIDDEN_DIM // 2),
+        # Проекция для числовых признаков mass и n_ingredients
+        self.numeric_proj = nn.Linear(2, config.HIDDEN_DIM // 4)  # уменьшаем размерность
+
+        # Классификатор теперь принимает объединённые признаки
+        combined_dim = config.HIDDEN_DIM + config.HIDDEN_DIM // 4
+        self.regressor = nn.Sequential(
+            nn.Linear(combined_dim, config.HIDDEN_DIM // 2),
             nn.LayerNorm(config.HIDDEN_DIM // 2),
             nn.ReLU(),
-            nn.Dropout(0.15),
-            nn.Linear(config.HIDDEN_DIM // 2, config.NUM_CLASSES)
+            nn.Dropout(config.DROPOUT),
+            nn.Linear(config.HIDDEN_DIM // 2, 1)      # выход одно значение
         )
 
-    def forward(self, input_ids, attention_mask, image):
-        text_features = self.text_model(input_ids, attention_mask).last_hidden_state[:,  0, :]
+    def forward(self, input_ids, attention_mask, image, mass, n_ingredients):
+        
+        text_features = self.text_model(input_ids, attention_mask).last_hidden_state[:, 0, :]
         image_features = self.image_model(image)
 
         text_emb = self.text_proj(text_features)
         image_emb = self.image_proj(image_features)
 
-        fused_emb = text_emb * image_emb
+        fused_emb = text_emb * image_emb  # поэлементное умножение
 
-        logits = self.classifier(fused_emb)
-        return logits
+        # обрабатываем числовые признаки
+        numeric = torch.stack([mass, n_ingredients], dim=1)
+        numeric_emb = self.numeric_proj(numeric)
+
+        # конкатенируем
+        combined = torch.cat([fused_emb, numeric_emb], dim=1)
+
+        # регрессия
+        pred = self.regressor(combined).squeeze(-1)
+
+        return pred
 
 
 def train(config, device):
@@ -97,11 +107,15 @@ def train(config, device):
         'params': model.image_model.parameters(),
         'lr': config.IMAGE_LR
     }, {
-        'params': model.classifier.parameters(),
+        'params': model.regressor.parameters(),
+        'lr': config.CLASSIFIER_LR
+    }, {
+        'params': model.numeric_proj.parameters(),
         'lr': config.CLASSIFIER_LR
     }])
 
-    criterion = nn.CrossEntropyLoss()
+    # Объявляем loss = MSE
+    criterion = nn.MSELoss()
 
     # Загрузка данных
     transforms = get_transforms(config)
@@ -119,33 +133,42 @@ def train(config, device):
                             collate_fn=partial(collate_fn,
                                                tokenizer=tokenizer))
 
-    # инициализируем метрику
-    f1_metric_train = torchmetrics.F1Score(
-        task="binary" if config.NUM_CLASSES == 2 else "multiclass",
-        num_classes=config.NUM_CLASSES).to(device)
-    f1_metric_val = torchmetrics.F1Score(
-        task="binary" if config.NUM_CLASSES == 2 else "multiclass",
-        num_classes=config.NUM_CLASSES).to(device)
-    best_f1_val = 0.0
+    # Инициализируем метрики регрессии
+    mae_metric_train = torchmetrics.MeanAbsoluteError().to(device)
+    rmse_metric_train = torchmetrics.MeanSquaredError(squared=False).to(device)
+
+    best_val_mae = float('inf')
+
+    # Для сохранения истории обучения
+    history = {
+        'train_loss': [], 'train_mae': [], 'train_rmse': [],
+        'val_loss': [], 'val_mae': [], 'val_rmse': []
+    }
 
     print("training started")
     for epoch in range(config.EPOCHS):
         model.train()
         total_loss = 0.0
 
+        # обнуляем метрики перед эпохой
+        mae_metric_train.reset()
+        rmse_metric_train.reset()
+
         for batch in train_loader:
             # Подготовка данных
             inputs = {
                 'input_ids': batch['input_ids'].to(device),
                 'attention_mask': batch['attention_mask'].to(device),
-                'image': batch['image'].to(device)
+                'image': batch['image'].to(device),
+                'mass': batch['mass'].to(device),          
+                'n_ingredients': batch['n_ingredients'].to(device) 
             }
-            labels = batch['label'].to(device)
+            labels = batch['label'].to(device)  
 
             # Forward
             optimizer.zero_grad()
-            logits = model(**inputs)
-            loss = criterion(logits, labels)
+            preds = model(**inputs)            
+            loss = criterion(preds, labels)
 
             # Backward
             loss.backward()
@@ -153,39 +176,70 @@ def train(config, device):
 
             total_loss += loss.item()
 
-            predicted = logits.argmax(dim=1)
-            _ = f1_metric_train(preds=predicted, target=labels)
+            # Обновляем метрики
+            mae_metric_train.update(preds, labels)
+            rmse_metric_train.update(preds, labels)
 
         # Валидация
-        train_f1 = f1_metric_train.compute().cpu().numpy()
-        val_f1 = validate(model, val_loader, device, f1_metric_val)
-        f1_metric_val.reset()
-        f1_metric_train.reset()
+        val_loss, val_mae, val_rmse = validate(model, val_loader, device, criterion)
+
+        # Вычисляем train метрики
+        train_loss = total_loss / len(train_loader)
+        train_mae = mae_metric_train.compute().cpu().numpy()
+        train_rmse = rmse_metric_train.compute().cpu().numpy()
+
+        # Сохраняем в историю
+        history['train_loss'].append(train_loss)
+        history['train_mae'].append(train_mae)
+        history['train_rmse'].append(train_rmse)
+        history['val_loss'].append(val_loss)
+        history['val_mae'].append(val_mae)
+        history['val_rmse'].append(val_rmse)
 
         print(
-            f"Epoch {epoch}/{config.EPOCHS-1} | avg_Loss: {total_loss/len(train_loader):.4f} | Train F1: {train_f1 :.4f}| Val F1: {val_f1 :.4f}"
+            f"Epoch {epoch}/{config.EPOCHS-1} | "
+            f"Train Loss: {train_loss:.4f} | Train MAE: {train_mae:.4f} | Train RMSE: {train_rmse:.4f} | "
+            f"Val Loss: {val_loss:.4f} | Val MAE: {val_mae:.4f} | Val RMSE: {val_rmse:.4f}"
         )
 
-        if val_f1 > best_f1_val:
-            print(f"New best model, epoch: {epoch}")
-            best_f1_val = val_f1
+        # Сохраняем лучшую модель по MAE
+        if val_mae < best_val_mae:
+            print(f"New best model, epoch: {epoch} (Val MAE: {val_mae:.4f})")
+            best_val_mae = val_mae
             torch.save(model.state_dict(), config.SAVE_PATH)
 
+    # Cохраним историю обучения
+    np.savez('training_history.npz', **history)
+    print("Training history saved to training_history.npz")
 
-def validate(model, val_loader, device, f1_metric):
+
+def validate(model, val_loader, device, criterion):
+
     model.eval()
+    total_loss = 0.0
+    mae_metric = torchmetrics.MeanAbsoluteError().to(device)
+    rmse_metric = torchmetrics.MeanSquaredError(squared=False).to(device)
 
     with torch.no_grad():
         for batch in val_loader:
             inputs = {
                 'input_ids': batch['input_ids'].to(device),
                 'attention_mask': batch['attention_mask'].to(device),
-                'image': batch['image'].to(device)
+                'image': batch['image'].to(device),
+                'mass': batch['mass'].to(device),
+                'n_ingredients': batch['n_ingredients'].to(device)
             }
             labels = batch['label'].to(device)
 
-            logits = model(**inputs)
-            predicted = logits.argmax(dim=1)
-            _ = f1_metric(preds=predicted, target=labels)
+            preds = model(**inputs)
+            loss = criterion(preds, labels)
+            total_loss += loss.item()
 
-    return f1_metric.compute().cpu().numpy()
+            mae_metric.update(preds, labels)
+            rmse_metric.update(preds, labels)
+
+    avg_loss = total_loss / len(val_loader)
+    mae = mae_metric.compute().cpu().numpy()
+    rmse = rmse_metric.compute().cpu().numpy()
+
+    return avg_loss, mae, rmse
