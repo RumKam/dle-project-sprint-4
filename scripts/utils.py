@@ -100,7 +100,7 @@ class MultimodalModel(nn.Module):
 
         combined = torch.cat([fused_emb, numeric_emb], dim=1)
 
-        # Regression
+        # Регрессия
         pred = self.regressor(combined).squeeze(-1)
 
         return pred
@@ -168,9 +168,7 @@ def train(config, device):
                'val_loss': [], 'val_mae': [], 'val_rmse': [], 'lr': []}
 
     print("=" * 60)
-    print(f"Starting training with {config.IMAGE_MODEL_NAME} + {config.TEXT_MODEL_NAME}")
-    print(f"Hidden dim: {config.HIDDEN_DIM}, Batch size: {config.BATCH_SIZE}")
-    print(f"Text augmentation: {config.USE_TEXT_AUG}")
+    print(f"Начало обучения {config.IMAGE_MODEL_NAME} + {config.TEXT_MODEL_NAME}")
     print("=" * 60)
     
     for epoch in range(config.EPOCHS):

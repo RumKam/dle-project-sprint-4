@@ -23,12 +23,10 @@ class MultimodalDataset(Dataset):
         self.ds_type = ds_type
         self.use_text_aug = config.USE_TEXT_AUG and ds_type == "train"
         
-        # === НОРМАЛИЗАЦИЯ ЦЕЛЕВОЙ ПЕРЕМЕННОЙ ===
         self.calorie_mean = self.df['total_calories'].mean()
         self.calorie_std = self.df['total_calories'].std()
         self.df['total_calories_norm'] = (self.df['total_calories'] - self.calorie_mean) / self.calorie_std
         
-        # === СТАНДАРТИЗАЦИЯ ЧИСЛОВЫХ ПРИЗНАКОВ ===
         self.mass_mean = self.df['total_mass'].mean()
         self.mass_std = self.df['total_mass'].std()
         self.n_ingr_mean = self.df['n_ingredients'].mean()
@@ -43,7 +41,7 @@ class MultimodalDataset(Dataset):
             return text
         
         words = text.split(',')
-        # С вероятностью 10% удаляем случайное слово (имитация пропуска ингредиента)
+        # С вероятностью 10% удаляем случайное слово
         if len(words) > 3 and random.random() < 0.1:
             idx_to_remove = random.randint(0, len(words) - 1)
             words.pop(idx_to_remove)
