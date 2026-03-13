@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
+from torch.optim.lr_scheduler import ReduceLROnPlateau, CosineAnnealingLR
 import torchmetrics
 from transformers import AutoModel, AutoTokenizer
 from scripts.dataset import MultimodalDataset, collate_fn, get_transforms
@@ -55,7 +56,7 @@ class MultimodalModel(nn.Module):
         self.numeric_proj = nn.Linear(2, config.HIDDEN_DIM // 4)
         self.numeric_norm = nn.BatchNorm1d(config.HIDDEN_DIM // 4)  
 
-        combined_dim = config.HIDDEN_DIM + config.HIDDEN_DIM // 4
+        combined_dim = config.HIDDEN_DIM * 2 + config.HIDDEN_DIM // 4
         self.regressor = nn.Sequential(
             nn.Linear(combined_dim, config.HIDDEN_DIM // 2),
             nn.BatchNorm1d(config.HIDDEN_DIM // 2),  
@@ -71,7 +72,8 @@ class MultimodalModel(nn.Module):
         text_emb = self.text_proj(text_features)
         image_emb = self.image_proj(image_features)
 
-        fused_emb = text_emb * image_emb
+        # Используем конкатенацию вместо поэлементного умножения
+        fused_emb = torch.cat([text_emb, image_emb], dim=1)
 
         # Числовые признаки
         numeric = torch.stack([mass, n_ingredients], dim=1)
@@ -99,6 +101,12 @@ def train(config, device):
         {'params': model.regressor.parameters(), 'lr': config.CLASSIFIER_LR},
         {'params': model.numeric_proj.parameters(), 'lr': config.CLASSIFIER_LR}
     ])
+
+    scheduler = ReduceLROnPlateau(optimizer, 
+                                  mode='min',            # минимизируем loss
+                                  factor=0.5,            # умножаем LR на 0.5 при плато
+                                  patience=3            # ждём 3 эпохи без улучшения
+                                  )
 
     criterion = nn.MSELoss()  
 
@@ -168,6 +176,8 @@ def train(config, device):
         print(f"Epoch {epoch}/{config.EPOCHS-1} | "
               f"Train Loss: {train_loss:.4f} | Train MAE: {train_mae:.4f} | Train RMSE: {train_rmse:.4f} | "
               f"Val Loss: {val_loss:.4f} | Val MAE: {val_mae:.4f} | Val RMSE: {val_rmse:.4f}")
+        
+        scheduler.step(val_loss)
 
         if val_mae < best_val_mae:
             print(f"New best model, epoch: {epoch} (Val MAE: {val_mae:.4f})")
