@@ -96,11 +96,16 @@ def train(config, device):
     set_requires_grad(model.image_model, unfreeze_pattern=config.IMAGE_MODEL_UNFREEZE, verbose=True)
 
     optimizer = AdamW([
-        {'params': model.text_model.parameters(), 'lr': config.TEXT_LR},
-        {'params': model.image_model.parameters(), 'lr': config.IMAGE_LR},
-        {'params': model.regressor.parameters(), 'lr': config.CLASSIFIER_LR},
-        {'params': model.numeric_proj.parameters(), 'lr': config.CLASSIFIER_LR}
-    ])
+    {'params': model.text_model.parameters(), 'lr': config.TEXT_LR},
+    {'params': model.image_model.parameters(), 'lr': config.IMAGE_LR},
+    {'params': [
+        *model.regressor.parameters(),
+        *model.text_proj.parameters(),  
+        *model.image_proj.parameters(),  
+        *model.numeric_proj.parameters(),
+        *model.numeric_norm.parameters() 
+    ], 'lr': config.CLASSIFIER_LR}
+])
 
     scheduler = ReduceLROnPlateau(optimizer, 
                                   mode='min',            # минимизируем loss
