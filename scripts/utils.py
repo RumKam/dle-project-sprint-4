@@ -52,143 +52,112 @@ class MultimodalModel(nn.Module):
         self.image_proj = nn.Linear(self.image_model.num_features, config.HIDDEN_DIM)
 
         # Проекция для числовых признаков mass и n_ingredients
-        self.numeric_proj = nn.Linear(2, config.HIDDEN_DIM // 4)  # уменьшаем размерность
+        self.numeric_proj = nn.Linear(2, config.HIDDEN_DIM // 4)
+        self.numeric_norm = nn.BatchNorm1d(config.HIDDEN_DIM // 4)  
 
-        # Классификатор теперь принимает объединённые признаки
         combined_dim = config.HIDDEN_DIM + config.HIDDEN_DIM // 4
         self.regressor = nn.Sequential(
             nn.Linear(combined_dim, config.HIDDEN_DIM // 2),
-            nn.LayerNorm(config.HIDDEN_DIM // 2),
+            nn.BatchNorm1d(config.HIDDEN_DIM // 2),  
             nn.ReLU(),
             nn.Dropout(config.DROPOUT),
-            nn.Linear(config.HIDDEN_DIM // 2, 1)      # выход одно значение
+            nn.Linear(config.HIDDEN_DIM // 2, 1)
         )
 
     def forward(self, input_ids, attention_mask, image, mass, n_ingredients):
-        
         text_features = self.text_model(input_ids, attention_mask).last_hidden_state[:, 0, :]
         image_features = self.image_model(image)
 
         text_emb = self.text_proj(text_features)
         image_emb = self.image_proj(image_features)
 
-        fused_emb = text_emb * image_emb  # поэлементное умножение
+        fused_emb = text_emb * image_emb
 
-        # обрабатываем числовые признаки
+        # Числовые признаки
         numeric = torch.stack([mass, n_ingredients], dim=1)
         numeric_emb = self.numeric_proj(numeric)
+        numeric_emb = self.numeric_norm(numeric_emb)
 
-        # конкатенируем
         combined = torch.cat([fused_emb, numeric_emb], dim=1)
 
-        # регрессия
         pred = self.regressor(combined).squeeze(-1)
 
         return pred
 
-
 def train(config, device):
     seed_everything(config.SEED)
 
-    # Инициализация модели
     model = MultimodalModel(config).to(device)
     tokenizer = AutoTokenizer.from_pretrained(config.TEXT_MODEL_NAME)
 
-    set_requires_grad(model.text_model,
-                      unfreeze_pattern=config.TEXT_MODEL_UNFREEZE, verbose=True)
-    set_requires_grad(model.image_model,
-                      unfreeze_pattern=config.IMAGE_MODEL_UNFREEZE, verbose=True)
+    set_requires_grad(model.text_model, unfreeze_pattern=config.TEXT_MODEL_UNFREEZE, verbose=True)
+    set_requires_grad(model.image_model, unfreeze_pattern=config.IMAGE_MODEL_UNFREEZE, verbose=True)
 
-    # Оптимизатор с разными LR
-    optimizer = AdamW([{
-        'params': model.text_model.parameters(),
-        'lr': config.TEXT_LR
-    }, {
-        'params': model.image_model.parameters(),
-        'lr': config.IMAGE_LR
-    }, {
-        'params': model.regressor.parameters(),
-        'lr': config.CLASSIFIER_LR
-    }, {
-        'params': model.numeric_proj.parameters(),
-        'lr': config.CLASSIFIER_LR
-    }])
+    optimizer = AdamW([
+        {'params': model.text_model.parameters(), 'lr': config.TEXT_LR},
+        {'params': model.image_model.parameters(), 'lr': config.IMAGE_LR},
+        {'params': model.regressor.parameters(), 'lr': config.CLASSIFIER_LR},
+        {'params': model.numeric_proj.parameters(), 'lr': config.CLASSIFIER_LR}
+    ])
 
-    # Объявляем loss = MSE
-    criterion = nn.MSELoss()
+    criterion = nn.MSELoss()  
 
-    # Загрузка данных
     transforms = get_transforms(config)
     val_transforms = get_transforms(config, ds_type="val")
-    train_dataset = MultimodalDataset(config, transforms)
+
+    train_dataset = MultimodalDataset(config, transforms, ds_type="train")
     val_dataset = MultimodalDataset(config, val_transforms, ds_type="val")
+
     train_loader = DataLoader(train_dataset,
                               batch_size=config.BATCH_SIZE,
                               shuffle=True,
-                              collate_fn=partial(collate_fn,
-                                                 tokenizer=tokenizer))
+                              collate_fn=partial(collate_fn, tokenizer=tokenizer))
     val_loader = DataLoader(val_dataset,
                             batch_size=config.BATCH_SIZE,
                             shuffle=False,
-                            collate_fn=partial(collate_fn,
-                                               tokenizer=tokenizer))
-
-    # Инициализируем метрики регрессии
-    mae_metric_train = torchmetrics.MeanAbsoluteError().to(device)
-    rmse_metric_train = torchmetrics.MeanSquaredError(squared=False).to(device)
+                            collate_fn=partial(collate_fn, tokenizer=tokenizer))
 
     best_val_mae = float('inf')
-
-    # Для сохранения истории обучения
-    history = {
-        'train_loss': [], 'train_mae': [], 'train_rmse': [],
-        'val_loss': [], 'val_mae': [], 'val_rmse': []
-    }
+    history = {'train_loss': [], 'train_mae': [], 'train_rmse': [],
+               'val_loss': [], 'val_mae': [], 'val_rmse': []}
 
     print("training started")
     for epoch in range(config.EPOCHS):
         model.train()
         total_loss = 0.0
-
-        # обнуляем метрики перед эпохой
-        mae_metric_train.reset()
-        rmse_metric_train.reset()
+        mae_metric_train = torchmetrics.MeanAbsoluteError().to(device)
+        rmse_metric_train = torchmetrics.MeanSquaredError(squared=False).to(device)
 
         for batch in train_loader:
-            # Подготовка данных
             inputs = {
                 'input_ids': batch['input_ids'].to(device),
                 'attention_mask': batch['attention_mask'].to(device),
                 'image': batch['image'].to(device),
-                'mass': batch['mass'].to(device),          
-                'n_ingredients': batch['n_ingredients'].to(device) 
+                'mass': batch['mass'].to(device),
+                'n_ingredients': batch['n_ingredients'].to(device)
             }
-            labels = batch['label'].to(device)  
+            labels = batch['label'].to(device)
 
-            # Forward
             optimizer.zero_grad()
-            preds = model(**inputs)            
+            preds = model(**inputs)
             loss = criterion(preds, labels)
-
-            # Backward
             loss.backward()
+
+            # Gradient Clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
             optimizer.step()
 
             total_loss += loss.item()
-
-            # Обновляем метрики
             mae_metric_train.update(preds, labels)
             rmse_metric_train.update(preds, labels)
 
-        # Валидация
-        val_loss, val_mae, val_rmse = validate(model, val_loader, device, criterion)
-
-        # Вычисляем train метрики
         train_loss = total_loss / len(train_loader)
         train_mae = mae_metric_train.compute().cpu().numpy()
         train_rmse = rmse_metric_train.compute().cpu().numpy()
 
-        # Сохраняем в историю
+        val_loss, val_mae, val_rmse = validate(model, val_loader, device, criterion)
+
         history['train_loss'].append(train_loss)
         history['train_mae'].append(train_mae)
         history['train_rmse'].append(train_rmse)
@@ -196,19 +165,15 @@ def train(config, device):
         history['val_mae'].append(val_mae)
         history['val_rmse'].append(val_rmse)
 
-        print(
-            f"Epoch {epoch}/{config.EPOCHS-1} | "
-            f"Train Loss: {train_loss:.4f} | Train MAE: {train_mae:.4f} | Train RMSE: {train_rmse:.4f} | "
-            f"Val Loss: {val_loss:.4f} | Val MAE: {val_mae:.4f} | Val RMSE: {val_rmse:.4f}"
-        )
+        print(f"Epoch {epoch}/{config.EPOCHS-1} | "
+              f"Train Loss: {train_loss:.4f} | Train MAE: {train_mae:.4f} | Train RMSE: {train_rmse:.4f} | "
+              f"Val Loss: {val_loss:.4f} | Val MAE: {val_mae:.4f} | Val RMSE: {val_rmse:.4f}")
 
-        # Сохраняем лучшую модель по MAE
         if val_mae < best_val_mae:
             print(f"New best model, epoch: {epoch} (Val MAE: {val_mae:.4f})")
             best_val_mae = val_mae
             torch.save(model.state_dict(), config.SAVE_PATH)
 
-    # Cохраним историю обучения
     np.savez('training_history.npz', **history)
     print("Training history saved to training_history.npz")
 
