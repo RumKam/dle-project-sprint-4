@@ -82,9 +82,8 @@ class MultimodalModel(nn.Module):
         )
 
     def forward(self, input_ids, attention_mask, image, mass, n_ingredients):
-
         text_output = self.text_model(input_ids=input_ids, attention_mask=attention_mask)
-        text_features = text_output.last_hidden_state[:, 0, :]
+        text_features = text_output.last_hidden_state[:, 0, :]  # [CLS] токен
         
         image_features = self.image_model(image)
 
@@ -100,7 +99,6 @@ class MultimodalModel(nn.Module):
 
         combined = torch.cat([fused_emb, numeric_emb], dim=1)
 
-        # Регрессия
         pred = self.regressor(combined).squeeze(-1)
 
         return pred
@@ -129,26 +127,22 @@ def train(config, device):
         ], 'lr': config.CLASSIFIER_LR}
     ], weight_decay=config.WEIGHT_DECAY)
 
-    train_df = pd.read_csv(config.TRAIN_DF_PATH)
-    steps_per_epoch = len(train_df) // config.BATCH_SIZE
-    total_steps = steps_per_epoch * config.EPOCHS
-    
-    scheduler = OneCycleLR(
-        optimizer,
-        max_lr=[config.TEXT_LR, config.IMAGE_LR, config.CLASSIFIER_LR],
-        total_steps=total_steps,
-        pct_start=0.3,
-        anneal_strategy='cos',
-        cycle_momentum=True
-    )
-
     criterion = nn.MSELoss()
 
     transforms = get_transforms(config)
     val_transforms = get_transforms(config, ds_type="val")
 
     train_dataset = MultimodalDataset(config, transforms, ds_type="train")
-    val_dataset = MultimodalDataset(config, val_transforms, ds_type="val")
+    
+    # Формируем словарь статистик для последующего использования
+    norm_stats = {
+        'calorie': {'mean': train_dataset.calorie_mean, 'std': train_dataset.calorie_std},
+        'mass': {'mean': train_dataset.mass_mean, 'std': train_dataset.mass_std},
+        'n_ingr': {'mean': train_dataset.n_ingr_mean, 'std': train_dataset.n_ingr_std}
+    }
+
+    # Валидационный датасет использует статистики тренировочного
+    val_dataset = MultimodalDataset(config, val_transforms, ds_type="val", norm_stats=norm_stats)
 
     train_loader = DataLoader(train_dataset,
                               batch_size=config.BATCH_SIZE,
@@ -163,6 +157,18 @@ def train(config, device):
                             num_workers=config.NUM_WORKERS,
                             pin_memory=True)
 
+    steps_per_epoch = len(train_loader)
+    total_steps = steps_per_epoch * config.EPOCHS
+
+    scheduler = OneCycleLR(
+        optimizer,
+        max_lr=[config.TEXT_LR, config.IMAGE_LR, config.CLASSIFIER_LR],
+        total_steps=total_steps,
+        pct_start=0.3,
+        anneal_strategy='cos',
+        cycle_momentum=True
+    )
+
     best_val_mae = float('inf')
     history = {'train_loss': [], 'train_mae': [], 'train_rmse': [],
                'val_loss': [], 'val_mae': [], 'val_rmse': [], 'lr': []}
@@ -170,7 +176,7 @@ def train(config, device):
     print("=" * 60)
     print(f"Начало обучения {config.IMAGE_MODEL_NAME} + {config.TEXT_MODEL_NAME}")
     print("=" * 60)
-    
+
     for epoch in range(config.EPOCHS):
         model.train()
         total_loss = 0.0
@@ -200,11 +206,11 @@ def train(config, device):
             lr_values.append(optimizer.param_groups[0]['lr'])
 
             total_loss += loss.item()
-            
-            # Денормализация для метрик
+
+            # Денормализация для метрик (используем статистики из батча)
             preds_real = preds * batch['calorie_std'] + batch['calorie_mean']
             labels_real = labels * batch['calorie_std'] + batch['calorie_mean']
-            
+
             mae_metric_train.update(preds_real, labels_real)
             rmse_metric_train.update(preds_real, labels_real)
 
@@ -229,13 +235,12 @@ def train(config, device):
               f"Train Loss: {train_loss:8.2f} | Train MAE: {train_mae:6.2f} | "
               f"Val Loss: {val_loss:8.2f} | Val MAE: {val_mae:6.2f} | "
               f"LR: {avg_lr:.2e}")
-        
+
         if val_mae < best_val_mae:
             best_val_mae = val_mae
             torch.save({
                 'model_state_dict': model.state_dict(),
-                'calorie_mean': train_dataset.calorie_mean,
-                'calorie_std': train_dataset.calorie_std,
+                'norm_stats': norm_stats,
                 'config': {
                     'IMAGE_MODEL_NAME': config.IMAGE_MODEL_NAME,
                     'TEXT_MODEL_NAME': config.TEXT_MODEL_NAME,
